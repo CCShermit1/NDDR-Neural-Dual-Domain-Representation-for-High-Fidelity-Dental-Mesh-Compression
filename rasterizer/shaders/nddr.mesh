@@ -1,0 +1,239 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive: require
+#extension GL_EXT_mesh_shader: require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "payload.h"
+
+const uint WORK_GROUP_SIZE = 8;
+
+layout (local_size_x = WORK_GROUP_SIZE, local_size_y = WORK_GROUP_SIZE) in;
+
+// Each mesh shader does at least a quadrant of a patch
+layout (triangles, max_vertices = 64, max_primitives = 98) out;
+
+// Inputs
+taskPayloadSharedEXT Payload payload;
+
+layout (push_constant) uniform NDDRPushConstants {
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+};
+
+// Local execution data
+const uint ENCODING_LEVELS = 8;
+const uint FFIN = FEATURE_SIZE + 3 * 2 * ENCODING_LEVELS;
+
+// Neural network weights
+layout (binding = 0) uniform isampler1D ctex;
+layout (binding = 1) uniform sampler1D vtex;
+layout (binding = 2) uniform sampler2D ftex;
+layout (binding = 3) uniform sampler1D biases;
+layout (binding = 4) uniform sampler2D w0;
+layout (binding = 5) uniform sampler2D w1;
+layout (binding = 6) uniform sampler2D w2;
+layout (binding = 7) uniform sampler2D w3;
+
+// Outputs
+layout (location = 0) out vec3 position[];
+layout (location = 2) out flat uint pindex[];
+
+vec4 project(vec3 p)
+{
+	vec4 pp = proj * view * model * vec4(p, 1.0f);
+	pp.y = -pp.y;
+	return pp;
+}
+
+#define leaky_relu(x) max(x, 0.01 * x)
+
+const uint MSIZE = max(FFIN, 64);
+
+// For evaluating the network
+shared vec4 row[MSIZE];
+
+vec3 eval(vec2 uv)
+{
+	float A[MSIZE];
+	vec4 B[16];
+
+	ivec4 complex = texelFetch(ctex, int(payload.pindex), 0);
+
+	vec3 v0 = texelFetch(vtex, complex.x, 0).xyz;
+	vec3 v1 = texelFetch(vtex, complex.y, 0).xyz;
+	vec3 v2 = texelFetch(vtex, complex.z, 0).xyz;
+	vec3 v3 = texelFetch(vtex, complex.w, 0).xyz;
+
+	vec3 vertex = mix(mix(v0, v1, uv.y), mix(v3, v2, uv.y), uv.x);
+
+	for (uint i = 0; i < FEATURE_SIZE; i++) {
+		vec4 fv = texelFetch(ftex, ivec2(i, payload.pindex), 0);
+		A[i] = mix(mix(fv.x, fv.y, uv.y), mix(fv.w, fv.z, uv.y), uv.x);
+	}
+
+	// Positional encoding
+	const float powers[] = float[](1, 2, 4, 8, 16, 32, 64, 128);
+
+	uint k = FEATURE_SIZE;
+	for (uint i = 0; i < ENCODING_LEVELS; i++) {
+		float p = powers[i];
+		vec3 sin_v = sin(p * vertex);
+		vec3 cos_v = cos(p * vertex);
+
+		A[k++] = sin_v.x;
+		A[k++] = sin_v.y;
+		A[k++] = sin_v.z;
+
+		A[k++] = cos_v.x;
+		A[k++] = cos_v.y;
+		A[k++] = cos_v.z;
+	}
+
+	// Network evaluation
+	uint tid = gl_LocalInvocationID.x + gl_LocalInvocationID.y * gl_WorkGroupSize.x;
+	uint stride = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+
+	// Layer 0
+	for (uint i = 0; i < 16; i++) {
+		uint k = i << 2;
+
+		// Load matrix row into shared memory
+		if (tid == 0) {
+			for (uint j = 0; j < FFIN; j++)
+				row[j] = texelFetch(w0, ivec2(i, j), 0);
+		}
+
+		barrier();
+
+		// Evaluate
+		vec4 v = texelFetch(biases, int(i), 0);
+		for (uint j = 0; j < FFIN; j++)
+			v += A[j] * row[j];
+
+		B[i] = leaky_relu(v);
+	}
+
+	// Layer 1
+	for (uint i = 0; i < 16; i++) {
+		uint k = i << 2;
+
+		// Evaluate
+		vec4 v = texelFetch(biases, int(i) + 16, 0);
+		for (uint j = 0; j < 16; j++) {
+			uint l = j << 2;
+			vec4 v0 = texelFetch(w1, ivec2(i, l + 0), 0);
+			vec4 v1 = texelFetch(w1, ivec2(i, l + 1), 0);
+			vec4 v2 = texelFetch(w1, ivec2(i, l + 2), 0);
+			vec4 v3 = texelFetch(w1, ivec2(i, l + 3), 0);
+			vec4 s = B[j];
+
+			v += s.x * v0 + s.y * v1 + s.z * v2 + s.w * v3;
+		}
+
+		vec4 lv = leaky_relu(v);
+		A[k + 0] = lv.x;
+		A[k + 1] = lv.y;
+		A[k + 2] = lv.z;
+		A[k + 3] = lv.w;
+	}
+
+	// Layer 2
+	for (uint i = 0; i < 16; i++) {
+		uint k = i << 2;
+
+		// Evaluate
+		vec4 v = texelFetch(biases, int(i) + 32, 0);
+		for (uint j = 0; j < 64; j++)
+			v += A[j] * texelFetch(w2, ivec2(i, j), 0);
+
+		vec4 lv = leaky_relu(v);
+
+		// Fuse with the last layer
+		vec4 wx = texelFetch(w3, ivec2(i, 0), 0);
+		vec4 wy = texelFetch(w3, ivec2(i, 1), 0);
+		vec4 wz = texelFetch(w3, ivec2(i, 2), 0);
+
+		vertex.x += dot(wx, lv);
+		vertex.y += dot(wy, lv);
+		vertex.z += dot(wz, lv);
+	}
+
+	return vertex + texelFetch(biases, 3 << 6, 0).xyz;
+}
+
+void main()
+{
+	const uint MAX_QSIZE = WORK_GROUP_SIZE - 1;
+
+	uvec2 offset = gl_LocalInvocationID.xy + (MAX_QSIZE * gl_WorkGroupID.xy);
+	if (offset.x > payload.resolution
+			|| offset.y > payload.resolution)
+		return;
+
+	uvec2 offset_triangles = MAX_QSIZE * gl_WorkGroupID.xy;
+
+	uint total_qsize = payload.resolution - 1;
+	uint qwidth = min(MAX_QSIZE, total_qsize - offset_triangles.x);
+	uint qheight = min(MAX_QSIZE, total_qsize - offset_triangles.y);
+
+	uint vwidth = qwidth + 1;
+	uint vheight = qheight + 1;
+	SetMeshOutputsEXT(vwidth * vheight, 2 * qwidth * qheight);
+
+	vec2 uv = offset/float(payload.resolution - 1);
+
+	vec3 v = eval(uv);
+
+	// Send position to fragment shader for normal vector calculations
+	position[gl_LocalInvocationIndex] = vec3(model * vec4(v, 1.0f));
+	pindex[gl_LocalInvocationIndex] = payload.pindex;
+
+	gl_MeshVerticesEXT[gl_LocalInvocationIndex].gl_Position = project(v);
+
+	uint gli = gl_LocalInvocationIndex;
+	if (gl_LocalInvocationID.x < qwidth
+			&& gl_LocalInvocationID.y < qheight) {
+		uint prim = 2 * (gl_LocalInvocationID.x + qwidth * gl_LocalInvocationID.y);
+
+		// Assumes that the subgroup size is 32
+		uint gsi = gl_SubgroupInvocationID;
+
+		float sign = 1;
+		uint side = gsi + 1;
+		if (side >= 32 || gl_LocalInvocationID.x >= qwidth) {
+			side = gsi - 1;
+			sign *= -1;
+		}
+
+		uint vert = gsi + WORK_GROUP_SIZE;
+		if (vert >= 32) {
+			vert = gsi - WORK_GROUP_SIZE;
+			sign *= -1;
+		}
+
+		uint sidevert = gsi + WORK_GROUP_SIZE + 1;
+		if (sidevert >= 32)
+			sidevert = gsi - WORK_GROUP_SIZE + 1;
+		if (sidevert >= 32)
+			sidevert = gsi - WORK_GROUP_SIZE - 1;
+
+		vec3 sv = subgroupShuffle(v, side);
+		vec3 vv = subgroupShuffle(v, vert);
+		vec3 svv = subgroupShuffle(v, sidevert);
+
+		float d0 = length(v - svv);
+		float d1 = length(sv - vv);
+
+		if (d0 > d1) {
+			gl_PrimitiveTriangleIndicesEXT[prim] = uvec3(gli, gli + 1, gli + WORK_GROUP_SIZE);
+			gl_PrimitiveTriangleIndicesEXT[prim + 1] = uvec3(gli + 1, gli + WORK_GROUP_SIZE + 1, gli + WORK_GROUP_SIZE);
+		} else {
+			gl_PrimitiveTriangleIndicesEXT[prim] = uvec3(gli, gli + 1, gli + WORK_GROUP_SIZE + 1);
+			gl_PrimitiveTriangleIndicesEXT[prim + 1] = uvec3(gli, gli + WORK_GROUP_SIZE + 1, gli + WORK_GROUP_SIZE);
+
+		}
+	}
+}

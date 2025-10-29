@@ -1,0 +1,16 @@
+cmake
+imageio
+matplotlib
+meshio
+nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast
+opencv-python
+polyscope
+pymeshlab
+seaborn
+setuptools
+trimesh
+torch
+torchvision
+tqdm
+wheel
+./extensions

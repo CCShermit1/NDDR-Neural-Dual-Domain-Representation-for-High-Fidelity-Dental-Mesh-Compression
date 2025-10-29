@@ -1,0 +1,58 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive: require
+#extension GL_EXT_mesh_shader: require
+
+#include "payload.h"
+
+layout (binding = 0) uniform isampler1D ctex;
+layout (binding = 1) uniform sampler1D vtex;
+
+layout (push_constant) uniform NDDRPushConstants
+{
+	mat4 model;
+	mat4 view;
+	mat4 proj;
+
+	// TODO: flags
+	int flags;
+	int resolution;
+	vec3 viewing;
+	float time;
+};
+
+taskPayloadSharedEXT Payload payload;
+
+// TODO: (atomic) counter for number of primitives sent
+
+void main()
+{
+	payload.pindex = gl_GlobalInvocationID.x;
+
+	// Approximate backface culling
+	if ((flags & 0x1) == 0x1) {
+		ivec4 complex = texelFetch(ctex, int(payload.pindex), 0);
+
+		vec3 v0 = texelFetch(vtex, complex.x, 0).xyz;
+		vec3 v1 = texelFetch(vtex, complex.y, 0).xyz;
+		vec3 v2 = texelFetch(vtex, complex.z, 0).xyz;
+		vec3 v3 = texelFetch(vtex, complex.w, 0).xyz;
+
+		vec3 n1 = normalize(cross(v0 - v1, v0 - v3));
+		vec3 n2 = normalize(cross(v1 - v2, v1 - v0));
+		vec3 n3 = normalize(cross(v2 - v3, v2 - v1));
+		vec3 n4 = normalize(cross(v3 - v0, v3 - v2));
+
+		float tol = 0.25;
+		if (true
+			&& (dot(n1, viewing) < -tol)
+			&& (dot(n2, viewing) < -tol)
+			&& (dot(n3, viewing) < -tol)
+			&& (dot(n4, viewing) < -tol))
+			return;
+	}
+
+	payload.resolution = resolution;
+	uint groups = (payload.resolution - 1 + 6)/7;
+	EmitMeshTasksEXT(groups, groups, 1);
+}
